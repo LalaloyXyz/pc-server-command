@@ -3,10 +3,20 @@ use std::process::Command;
 use local_ip_address::local_ip;
 use serde::Deserialize;
 use warp::http::StatusCode;
+use std::sync::{Arc, Mutex};
+use std::time::{Instant, Duration};
+use tokio::time::sleep;
+
+const WAIT_FINAL_TIME: u64 = 1500;
 
 #[derive(Deserialize)]
 struct CommandRequest {
     command: String,
+}
+
+#[derive(Clone)]
+struct SharedState {
+    last_command: Arc<Mutex<(String, Instant)>>,
 }
 
 #[tokio::main]
@@ -14,16 +24,22 @@ async fn main() {
     let ip = local_ip().unwrap_or_else(|_| "127.0.0.1".parse().unwrap());
     let port = 8080;
 
-    println!("Server running at: http://{}:{}", ip, port);
-    println!("To send a command, use:");
+    let state = SharedState {
+        last_command: Arc::new(Mutex::new(("".to_string(), Instant::now()))),
+    };
+
+    let state_filter = warp::any().map(move || state.clone());
+
+    println!("Local IP : http://{}:{}", ip, port);
     println!(
-        "curl -X POST http://{}:{}/ -H \"Content-Type: application/json\" -d '{{\"command\": \"open (you want to open app)\"}}'",
+        "curl -X POST http://{}:{}/ -H \"Content-Type: application/json\" -d '{{\"command\": \"open google\"}}'",
         ip, port
     );
 
     let post_route = warp::post()
         .and(warp::path::end())
         .and(warp::body::json())
+        .and(state_filter)
         .map(handle_command);
 
     warp::serve(post_route)
@@ -31,22 +47,43 @@ async fn main() {
         .await;
 }
 
-fn handle_command(body: CommandRequest) -> impl warp::Reply {
+fn handle_command(body: CommandRequest, state: SharedState) -> impl warp::Reply {
+    let now = Instant::now();
     let command = body.command.trim().to_lowercase();
-    println!("Received command: {}", command);
+    {
+        let mut lock = state.last_command.lock().unwrap();
+        *lock = (command.clone(), now);
+    }
 
-    let open_prefixes = ["open ", "เปิด ", "open", "เปิด"];
-    let search_prefixes = ["search ", "ค้นหา ", "search", "ค้นหา"];
+    let shared = state.clone();
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(WAIT_FINAL_TIME)).await;
+        let (cmd, timestamp) = {
+            let lock = shared.last_command.lock().unwrap();
+            lock.clone()
+        };
 
-    let response = match parse_prefix(&command, &open_prefixes) {
-        Some(input) => try_launch_app(&input),
-        None => match parse_prefix(&command, &search_prefixes) {
-            Some(input) => search_for_app(&input),
-            None => "Invalid command.".to_string(),
-        },
-    };
+        if timestamp == now {
+            println!("Final command : {}", cmd);
 
-    warp::reply::with_status(response, StatusCode::OK)
+            let open_prefixes = ["open ", "เปิด ", "open", "เปิด"];
+            let search_prefixes = ["search ", "ค้นหา ", "search", "ค้นหา"];
+
+            let response = match parse_prefix(&cmd, &open_prefixes) {
+                Some(input) => try_launch_app(&input),
+                None => match parse_prefix(&cmd, &search_prefixes) {
+                    Some(input) => search_for_app(&input),
+                    None => "Invalid command.".to_string(),
+                },
+            };
+
+            println!("Response: {}", response);
+        } else {
+            println!("Skipped outdated command: {}", cmd);
+        }
+    });
+
+    warp::reply::with_status("Waiting for final input...", StatusCode::ACCEPTED)
 }
 
 fn parse_prefix(command: &str, prefixes: &[&str]) -> Option<String> {

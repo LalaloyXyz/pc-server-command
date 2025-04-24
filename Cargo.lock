@@ -668,7 +668,6 @@ dependencies = [
 name = "pc_load"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "local-ip-address",
  "serde",
  "serde_derive",
